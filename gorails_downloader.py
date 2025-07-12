@@ -395,15 +395,44 @@ class GoRailsDownloader:
             # Find all episode links in the playlist
             episode_links = []
 
-            # Look for episode links in the sidebar or main content
-            episode_elements = soup.find_all('a', href=re.compile(r'/episodes/'))
+            # Look for episode containers first (more reliable)
+            episode_containers = soup.find_all('div', id=re.compile(r'^episode_\d+$'))
 
-            for elem in episode_elements:
-                href = elem.get('href')
-                if href and '/episodes/' in href:
-                    full_url = urljoin(playlist_url, href)
-                    if full_url not in episode_links:
-                        episode_links.append(full_url)
+            if episode_containers:
+                log_verbose(f"Found {len(episode_containers)} episode containers")
+                # Extract episode URLs from each container
+                for container in episode_containers:
+                    # Find the first episode link within this container
+                    episode_link = container.find('a', href=re.compile(r'/episodes/'))
+                    if episode_link:
+                        href = episode_link.get('href')
+                        if href and '/episodes/' in href:
+                            # Remove query parameters to get clean URL
+                            clean_href = href.split('?')[0]
+                            full_url = urljoin(playlist_url, clean_href)
+                            if full_url not in episode_links:
+                                episode_links.append(full_url)
+                                log_verbose(f"Added episode: {full_url}")
+            else:
+                log_verbose("No episode containers found, using fallback method")
+                # Fallback: look for episode links, but exclude the hero section
+                # Find the main content area that contains the episode list
+                main_content = soup.find('main')
+                if main_content:
+                    # Look for episode links only within the main content area
+                    episode_elements = main_content.find_all('a', href=re.compile(r'/episodes/'))
+                else:
+                    # If no main content found, look everywhere but be more careful
+                    episode_elements = soup.find_all('a', href=re.compile(r'/episodes/'))
+
+                for elem in episode_elements:
+                    href = elem.get('href')
+                    if href and '/episodes/' in href:
+                        # Remove query parameters to get clean URL
+                        clean_href = href.split('?')[0]
+                        full_url = urljoin(playlist_url, clean_href)
+                        if full_url not in episode_links:
+                            episode_links.append(full_url)
 
             if not episode_links:
                 console.print("[red]No episode links found in playlist[/red]")
