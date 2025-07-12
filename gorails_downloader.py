@@ -12,6 +12,7 @@ import json
 import getpass
 import click
 import requests
+from datetime import datetime
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 from pathlib import Path
@@ -206,6 +207,50 @@ class GoRailsDownloader:
             title_elem = soup.find('h1')
             title = title_elem.get_text(strip=True) if title_elem else "Unknown Title"
 
+            # Extract creation date
+            created_at = None
+            
+            # Try to get date from the visible date element first
+            # Look for a <p> element that comes after the <h1> title
+            title_elem = soup.find('h1')
+            date_elem = None
+            if title_elem:
+                # Find the next <p> element after the h1
+                for sibling in title_elem.find_next_siblings():
+                    if sibling.name == 'p':
+                        date_text = sibling.get_text(strip=True)
+                        # Check if this looks like a date (contains month names and year)
+                        if any(month in date_text for month in ['January', 'February', 'March', 'April', 'May', 'June', 
+                                                               'July', 'August', 'September', 'October', 'November', 'December']):
+                            date_elem = sibling
+                            break
+            
+            if date_elem:
+                date_text = date_elem.get_text(strip=True)
+                try:
+                    # Parse date like "September  5, 2019"
+                    created_at = datetime.strptime(date_text, '%B %d, %Y')
+                    log_verbose(f"Parsed date from visible element: {date_text} -> {created_at}")
+                except ValueError:
+                    log_verbose(f"Could not parse date from visible element: {date_text}")
+            
+            # If no date found, try to get it from JSON-LD structured data
+            if not created_at:
+                script_elem = soup.find('script', type='application/ld+json')
+                if script_elem:
+                    try:
+                        json_data = json.loads(script_elem.string)
+                        if 'uploadDate' in json_data:
+                            upload_date_str = json_data['uploadDate']
+                            # Parse ISO format like "2019-09-05T00:00:00-05:00"
+                            created_at = datetime.fromisoformat(upload_date_str.replace('Z', '+00:00'))
+                            log_verbose(f"Parsed date from JSON-LD: {upload_date_str} -> {created_at}")
+                    except (json.JSONDecodeError, ValueError, KeyError) as e:
+                        log_verbose(f"Could not parse date from JSON-LD: {e}")
+            
+            if not created_at:
+                log_verbose("No creation date found")
+
             # Find download link
             download_link = soup.find('a', href=re.compile(r'/download'))
             if not download_link:
@@ -217,7 +262,8 @@ class GoRailsDownloader:
             return {
                 'title': title,
                 'download_url': download_url,
-                'page_url': url
+                'page_url': url,
+                'created_at': created_at
             }
 
         except Exception as e:
@@ -253,13 +299,13 @@ class GoRailsDownloader:
                 return None
 
             # Download the video
-            return self._download_file(direct_url, video_info['title'], position, force)
+            return self._download_file(direct_url, video_info['title'], position, force, video_info.get('created_at'))
 
         except Exception as e:
             console.print(f"[red]Error downloading video: {e}[/red]")
             return None
 
-    def _download_file(self, url, title, position=None, force=False):
+    def _download_file(self, url, title, position=None, force=False, created_at=None):
         """Download a file with progress tracking."""
         try:
             # Clean filename
@@ -298,7 +344,6 @@ class GoRailsDownloader:
                     TextColumn("[progress.description]{task.description}"),
                     BarColumn(),
                     TaskProgressColumn(),
-                    TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
                     TimeRemainingColumn(),
                     console=console
             ) as progress:
@@ -314,6 +359,16 @@ class GoRailsDownloader:
                             progress.update(task, completed=downloaded)
 
                 progress.update(task, description=f"Downloaded {filename}")
+
+            # Set file modification time to creation date if available
+            if created_at:
+                try:
+                    import time
+                    timestamp = created_at.timestamp()
+                    os.utime(filepath, (timestamp, timestamp))
+                    log_verbose(f"Set file modification time to {created_at.strftime('%Y-%m-%d %H:%M:%S')}")
+                except Exception as e:
+                    log_verbose(f"Could not set file modification time: {e}")
 
             console.print(f"[green]Successfully downloaded: {filename}[/green]")
             return {
@@ -487,11 +542,6 @@ def video(ctx, url):
     downloader = ctx.obj['downloader']
     force = ctx.obj.get('force', False)
 
-    console.print(Panel(
-        Text("GoRails Video Downloader", style="bold blue"),
-        title="Downloading single video..."
-    ))
-
     # Authenticate first
     if not downloader.authenticate(ctx):
         console.print("[red]Authentication required to download videos[/red]")
@@ -535,11 +585,6 @@ def all_series(ctx):
     downloader = ctx.obj['downloader']
     force = ctx.obj.get('force', False)
 
-    console.print(Panel(
-        Text("GoRails Video Downloader", style="bold blue"),
-        title="Downloading all series..."
-    ))
-
     if not downloader.authenticate(ctx):
         console.print("[red]Authentication required to download videos[/red]")
         sys.exit(1)
@@ -557,12 +602,7 @@ def all_series(ctx):
 def auth(ctx):
     """Manage authentication for GoRails."""
     downloader = GoRailsDownloader()
-    
-    console.print(Panel(
-        Text("GoRails Authentication Manager", style="bold blue"),
-        title="Manage your authentication settings"
-    ))
-    
+
     if downloader.authenticate(ctx):
         console.print("[green]Authentication successful![/green]")
     else:
@@ -585,6 +625,11 @@ def info():
     info_text.append("\n  --force, -f              - Force download and overwrite existing files")
     info_text.append("\n  --output-dir, -o <dir>   - Output directory for downloads")
     info_text.append("\n  --verbose, -v            - Enable verbose logging")
+    info_text.append("\n\nFeatures:", style="bold")
+    info_text.append("\n  • Skip existing files (use --force to overwrite)")
+    info_text.append("\n  • Set file modification time to video creation date")
+    info_text.append("\n  • Progress tracking with download speed")
+    info_text.append("\n  • Session persistence for authentication")
 
     console.print(Panel(
         info_text,
