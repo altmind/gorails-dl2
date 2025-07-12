@@ -353,7 +353,7 @@ class GoRailsDownloader:
 
                 with open(filepath, 'wb') as f:
                     downloaded = 0
-                    for chunk in response.iter_content(chunk_size=8192):
+                    for chunk in response.iter_content(chunk_size=1024*64):
                         if chunk:
                             f.write(chunk)
                             downloaded += len(chunk)
