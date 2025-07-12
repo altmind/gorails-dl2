@@ -108,22 +108,22 @@ class GoRailsAuth:
         """Perform actual login to GoRails."""
         try:
             log_verbose(f"Attempting to login with email: {email}", ctx)
-            
+
             # First, get the login page to extract CSRF token
             login_url = "https://gorails.com/users/sign_in"
             response = session.get(login_url)
             response.raise_for_status()
-            
+
             # Parse the login page to get CSRF token
             soup = BeautifulSoup(response.content, 'html.parser')
             csrf_token = soup.find('meta', attrs={'name': 'csrf-token'})
-            
+
             if not csrf_token:
                 console.print("[red]Could not find CSRF token on login page[/red]")
                 return None
-            
+
             csrf_value = csrf_token.get('content')
-            
+
             # Prepare login data
             login_data = {
                 'authenticity_token': csrf_value,
@@ -132,11 +132,11 @@ class GoRailsAuth:
                 'user[remember_me]': '1',  # Remember me for session persistence
                 'commit': 'Log in'
             }
-            
+
             # Perform login request
             log_verbose("Submitting login request...", ctx)
             login_response = session.post(login_url, data=login_data)
-            
+
             # Check if login was successful
             if login_response.status_code in [200, 302]:
                 # Check if we have a session cookie
@@ -159,7 +159,7 @@ class GoRailsAuth:
                 except:
                     pass
                 return None
-                
+
         except Exception as e:
             console.print(f"[red]Login error: {e}[/red]")
             return None
@@ -181,10 +181,10 @@ class GoRailsDownloader:
         """Authenticate with GoRails."""
         # Try to load saved session first
         session_id = self.auth.load_session()
-        
+
         if not session_id:
             session_id = self.auth.get_credentials(self.session, ctx)
-        
+
         if session_id:
             # Set the session cookie
             self.session.cookies.set('_gorails_session', session_id, domain='gorails.com')
@@ -209,7 +209,7 @@ class GoRailsDownloader:
 
             # Extract creation date
             created_at = None
-            
+
             # Try to get date from the visible date element first
             # Look for a <p> element that comes after the <h1> title
             title_elem = soup.find('h1')
@@ -220,11 +220,12 @@ class GoRailsDownloader:
                     if sibling.name == 'p':
                         date_text = sibling.get_text(strip=True)
                         # Check if this looks like a date (contains month names and year)
-                        if any(month in date_text for month in ['January', 'February', 'March', 'April', 'May', 'June', 
-                                                               'July', 'August', 'September', 'October', 'November', 'December']):
+                        if any(month in date_text for month in ['January', 'February', 'March', 'April', 'May', 'June',
+                                                                'July', 'August', 'September', 'October', 'November',
+                                                                'December']):
                             date_elem = sibling
                             break
-            
+
             if date_elem:
                 date_text = date_elem.get_text(strip=True)
                 try:
@@ -233,7 +234,7 @@ class GoRailsDownloader:
                     log_verbose(f"Parsed date from visible element: {date_text} -> {created_at}")
                 except ValueError:
                     log_verbose(f"Could not parse date from visible element: {date_text}")
-            
+
             # If no date found, try to get it from JSON-LD structured data
             if not created_at:
                 script_elem = soup.find('script', type='application/ld+json')
@@ -247,7 +248,7 @@ class GoRailsDownloader:
                             log_verbose(f"Parsed date from JSON-LD: {upload_date_str} -> {created_at}")
                     except (json.JSONDecodeError, ValueError, KeyError) as e:
                         log_verbose(f"Could not parse date from JSON-LD: {e}")
-            
+
             if not created_at:
                 log_verbose("No creation date found")
 
@@ -310,13 +311,13 @@ class GoRailsDownloader:
         try:
             # Clean filename
             safe_title = re.sub(r'[<>:"/\\|?*]', '_', title)
-            
+
             # Include position in filename if provided
             if position is not None:
                 filename = f"{position:02d}_{safe_title}.mp4"
             else:
                 filename = f"{safe_title}.mp4"
-                
+
             filepath = os.path.join(self.output_dir, filename)
 
             # Check if file already exists
@@ -443,7 +444,7 @@ class GoRailsDownloader:
 
             # Find all series articles
             series_articles = soup.find_all('article', class_=lambda x: x and 'p-6' in x)
-            
+
             series_list = []
             for article in series_articles:
                 # Find the series link
@@ -451,7 +452,7 @@ class GoRailsDownloader:
                 if series_link:
                     href = series_link.get('href')
                     title = series_link.get_text(strip=True)
-                    
+
                     if href and title:
                         full_url = urljoin("https://gorails.com", href)
                         series_list.append({
@@ -472,25 +473,23 @@ class GoRailsDownloader:
         try:
             # Get the list of all series
             series_list = self.get_series_list()
-            
+
             if not series_list:
                 console.print("[red]No series found[/red]")
                 return None
 
-            console.print(f"\n[bold blue]Starting download of {len(series_list)} series[/bold blue]")
-            
             downloaded_series = []
             for i, series in enumerate(series_list, 1):
                 console.print(f"\n[bold]Series {i}/{len(series_list)}: {series['title']}[/bold]")
-                
+
                 # Create a subdirectory for this series
                 series_dir = os.path.join(self.output_dir, series['slug'])
                 os.makedirs(series_dir, exist_ok=True)
-                
+
                 # Create a temporary downloader for this series
                 series_downloader = GoRailsDownloader(series_dir)
                 series_downloader.session = self.session  # Reuse the authenticated session
-                
+
                 # Download the series
                 result = series_downloader.download_playlist(series['url'], force=force)
                 if result:
@@ -503,7 +502,8 @@ class GoRailsDownloader:
                         'skipped': result.get('skipped', 0),
                         'videos': result.get('videos', [])
                     })
-                    console.print(f"[green]✓ Downloaded series: {series['title']} ({result.get('downloaded', 0)}/{result.get('total_episodes', 0)} episodes, {result.get('skipped', 0)} skipped)[/green]")
+                    console.print(
+                        f"[green]✓ Downloaded series: {series['title']} ({result.get('downloaded', 0)}/{result.get('total_episodes', 0)} episodes, {result.get('skipped', 0)} skipped)[/green]")
                 else:
                     console.print(f"[red]✗ Failed to download series: {series['title']}[/red]")
 
@@ -519,7 +519,7 @@ class GoRailsDownloader:
 
 
 @click.group()
-@click.option('--output-dir', '-o', default='downloads', 
+@click.option('--output-dir', '-o', default='downloads',
               help='Output directory for downloaded videos')
 @click.option('--verbose', '-v', is_flag=True, default=False,
               help='Enable verbose logging')
@@ -572,7 +572,8 @@ def playlist(ctx, playlist_url):
 
     info = downloader.download_playlist(playlist_url, force=force)
     if info:
-        console.print(f"[green]Successfully downloaded playlist: {info.get('downloaded', 0)}/{info.get('total_episodes', 0)} episodes, {info.get('skipped', 0)} skipped[/green]")
+        console.print(
+            f"[green]Successfully downloaded playlist: {info.get('downloaded', 0)}/{info.get('total_episodes', 0)} episodes, {info.get('skipped', 0)} skipped[/green]")
     else:
         console.print("[red]Failed to download playlist[/red]")
         sys.exit(1)
@@ -591,7 +592,8 @@ def all_series(ctx):
 
     info = downloader.download_all_series(force=force)
     if info:
-        console.print(f"[green]Successfully downloaded {info.get('downloaded_series', 0)}/{info.get('total_series', 0)} series[/green]")
+        console.print(
+            f"[green]Successfully downloaded {info.get('downloaded_series', 0)}/{info.get('total_series', 0)} series[/green]")
     else:
         console.print("[red]Failed to download series[/red]")
         sys.exit(1)

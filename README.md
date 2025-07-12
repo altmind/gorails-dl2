@@ -2,6 +2,8 @@
 
 A minimal Python tool to download videos from the GoRails video series.
 
+![GoRails Downloader Screenshot](screenshot.png)
+
 ## Features
 
 - Download single videos from GoRails
