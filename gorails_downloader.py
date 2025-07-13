@@ -21,6 +21,8 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskPr
 from rich.panel import Panel
 from rich.text import Text
 from rich.prompt import Prompt, Confirm
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 console = Console()
 
@@ -166,8 +168,9 @@ class GoRailsAuth:
 
 
 class GoRailsDownloader:
-    def __init__(self, output_dir="downloads"):
+    def __init__(self, output_dir="downloads", max_workers=5):
         self.output_dir = output_dir
+        self.max_workers = max_workers
         self.auth = GoRailsAuth()
         self.session = requests.Session()
         self.session.headers.update({
@@ -176,6 +179,16 @@ class GoRailsDownloader:
 
         # Create output directory if it doesn't exist
         os.makedirs(output_dir, exist_ok=True)
+
+    def _create_session(self):
+        """Create a new session for thread-safe operations."""
+        session = requests.Session()
+        session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        })
+        # Copy cookies from main session
+        session.cookies.update(self.session.cookies)
+        return session
 
     def authenticate(self, ctx=None):
         """Authenticate with GoRails."""
@@ -194,11 +207,13 @@ class GoRailsDownloader:
             console.print("[red]Authentication failed![/red]")
             return False
 
-    def get_video_info(self, url):
+    def get_video_info(self, url, session=None):
         """Extract video information from GoRails page."""
         try:
+            if session is None:
+                session = self.session
             console.print(f"Fetching video page: {url}")
-            response = self.session.get(url)
+            response = session.get(url)
             response.raise_for_status()
 
             soup = BeautifulSoup(response.content, 'html.parser')
@@ -271,11 +286,13 @@ class GoRailsDownloader:
             console.print(f"[red]Error extracting video info: {e}[/red]")
             return None
 
-    def get_direct_video_url(self, download_url):
+    def get_direct_video_url(self, download_url, session=None):
         """Follow redirect to get direct video URL."""
         try:
+            if session is None:
+                session = self.session
             console.print(f"Following download redirect from {download_url}", end="")
-            response = self.session.get(download_url, allow_redirects=True)
+            response = session.get(download_url, allow_redirects=True)
             response.raise_for_status()
 
             # The final URL should be the direct video URL
@@ -286,29 +303,36 @@ class GoRailsDownloader:
             console.print(f"[red]Error getting direct video URL: {e}[/red]")
             return None
 
-    def download_video(self, url, position=None, force=False):
+    def download_video(self, url, position=None, force=False, session=None, progress=None, task_id=None):
         """Download a single video from the given URL."""
         try:
+            # Use provided session or create a new one
+            if session is None:
+                session = self.session
+
             # Get video info
-            video_info = self.get_video_info(url)
+            video_info = self.get_video_info(url, session)
             if not video_info:
                 return None
 
             # Get direct video URL
-            direct_url = self.get_direct_video_url(video_info['download_url'])
+            direct_url = self.get_direct_video_url(video_info['download_url'], session)
             if not direct_url:
                 return None
 
             # Download the video
-            return self._download_file(direct_url, video_info['title'], position, force, video_info.get('created_at'))
+            return self._download_file(direct_url, video_info['title'], position, force, video_info.get('created_at'), session, progress, task_id)
 
         except Exception as e:
             console.print(f"[red]Error downloading video: {e}[/red]")
             return None
 
-    def _download_file(self, url, title, position=None, force=False, created_at=None):
+    def _download_file(self, url, title, position=None, force=False, created_at=None, session=None, progress=None, task_id=None):
         """Download a file with progress tracking."""
         try:
+            if session is None:
+                session = self.session
+                
             # Clean filename
             safe_title = re.sub(r'[<>:"/\\|?*]', '_', title)
 
@@ -322,7 +346,10 @@ class GoRailsDownloader:
 
             # Check if file already exists
             if os.path.exists(filepath) and not force:
-                console.print(f"[yellow]File already exists, skipping: {filename}[/yellow]")
+                if progress and task_id is not None:
+                    progress.update(task_id, description=f"Skipped {filename}")
+                else:
+                    console.print(f"[yellow]File already exists, skipping: {filename}[/yellow]")
                 return {
                     'title': title,
                     'filename': filename,
@@ -331,35 +358,53 @@ class GoRailsDownloader:
                     'skipped': True
                 }
 
-            console.print(f"[green]Downloading: {title}[/green] from [red]{url}[/red]")
+            if progress and task_id is not None:
+                progress.update(task_id, description=f"Downloading {filename}")
+            else:
+                console.print(f"[green]Downloading: {title}[/green] from [red]{url}[/red]")
 
             # Start the download with streaming
-            response = self.session.get(url, stream=True)
+            response = session.get(url, stream=True)
             response.raise_for_status()
 
             # Get file size
             total_size = int(response.headers.get('content-length', 0))
 
-            with Progress(
-                    SpinnerColumn(),
-                    TextColumn("[progress.description]{task.description}"),
-                    BarColumn(),
-                    TaskProgressColumn(),
-                    TimeRemainingColumn(),
-                    console=console
-            ) as progress:
-
-                task = progress.add_task(f"Downloading {filename}", total=total_size)
-
+            # If we have a shared progress bar, use it
+            if progress and task_id is not None:
+                progress.update(task_id, total=total_size)
+                
                 with open(filepath, 'wb') as f:
                     downloaded = 0
                     for chunk in response.iter_content(chunk_size=1024*64):
                         if chunk:
                             f.write(chunk)
                             downloaded += len(chunk)
-                            progress.update(task, completed=downloaded)
+                            progress.update(task_id, completed=downloaded)
+                
+                progress.update(task_id, description=f"Downloaded {filename}")
+            else:
+                # Fallback to individual progress bar for single downloads
+                with Progress(
+                        SpinnerColumn(),
+                        TextColumn("[progress.description]{task.description}"),
+                        BarColumn(),
+                        TaskProgressColumn(),
+                        TimeRemainingColumn(),
+                        console=console
+                ) as individual_progress:
 
-                progress.update(task, description=f"Downloaded {filename}")
+                    task = individual_progress.add_task(f"Downloading {filename}", total=total_size)
+
+                    with open(filepath, 'wb') as f:
+                        downloaded = 0
+                        for chunk in response.iter_content(chunk_size=1024*64):
+                            if chunk:
+                                f.write(chunk)
+                                downloaded += len(chunk)
+                                individual_progress.update(task, completed=downloaded)
+
+                    individual_progress.update(task, description=f"Downloaded {filename}")
 
             # Set file modification time to creation date if available
             if created_at:
@@ -371,7 +416,8 @@ class GoRailsDownloader:
                 except Exception as e:
                     log_verbose(f"Could not set file modification time: {e}")
 
-            console.print(f"[green]Successfully downloaded: {filename}[/green]")
+            if not progress:
+                console.print(f"[green]Successfully downloaded: {filename}[/green]")
             return {
                 'title': title,
                 'filename': filename,
@@ -380,8 +426,16 @@ class GoRailsDownloader:
             }
 
         except Exception as e:
+            if progress and task_id is not None:
+                progress.update(task_id, description=f"Error: {filename}")
             console.print(f"[red]Error downloading file: {e}[/red]")
             return None
+
+    def _download_video_parallel(self, args):
+        """Helper function for parallel video downloads."""
+        url, position, force, progress, task_id = args
+        session = self._create_session()
+        return self.download_video(url, position, force, session, progress, task_id)
 
     def download_playlist(self, playlist_url, force=False):
         """Download all videos from a playlist."""
@@ -440,15 +494,50 @@ class GoRailsDownloader:
 
             console.print(f"Found {len(episode_links)} episodes")
 
+            # Prepare download tasks
+            download_tasks = [(url, i, force) for i, url in enumerate(episode_links, 1)]
+            
             downloaded_videos = []
             skipped_count = 0
-            for i, episode_url in enumerate(episode_links, 1):
-                console.print(f"\nDownloading episode {i}/{len(episode_links)}")
-                result = self.download_video(episode_url, position=i, force=force)
-                if result:
-                    if result.get('skipped', False):
-                        skipped_count += 1
-                    downloaded_videos.append(result)
+            
+            # Create a shared progress bar for all downloads
+            with Progress(
+                    SpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                    BarColumn(),
+                    TaskProgressColumn(),
+                    TimeRemainingColumn(),
+                    console=console
+            ) as progress:
+                
+                # Add tasks to the progress bar
+                task_ids = {}
+                for url, position, force in download_tasks:
+                    task_id = progress.add_task(f"Preparing episode {position}", total=0)
+                    task_ids[position] = task_id
+                
+                # Prepare download tasks with progress bar and task IDs
+                download_tasks_with_progress = [
+                    (url, position, force, progress, task_ids[position]) 
+                    for url, position, force in download_tasks
+                ]
+                
+                # Use ThreadPoolExecutor for parallel downloads
+                with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                    # Submit all download tasks
+                    future_to_url = {executor.submit(self._download_video_parallel, task): task[1] for task in download_tasks_with_progress}
+                    
+                    # Process completed downloads
+                    for future in as_completed(future_to_url):
+                        position = future_to_url[future]
+                        try:
+                            result = future.result()
+                            if result:
+                                if result.get('skipped', False):
+                                    skipped_count += 1
+                                downloaded_videos.append(result)
+                        except Exception as e:
+                            console.print(f"[red]Error downloading episode {position}: {e}[/red]")
 
             return {
                 'playlist_url': playlist_url,
@@ -516,7 +605,7 @@ class GoRailsDownloader:
                 os.makedirs(series_dir, exist_ok=True)
 
                 # Create a temporary downloader for this series
-                series_downloader = GoRailsDownloader(series_dir)
+                series_downloader = GoRailsDownloader(series_dir, self.max_workers)
                 series_downloader.session = self.session  # Reuse the authenticated session
 
                 # Download the series
@@ -554,11 +643,13 @@ class GoRailsDownloader:
               help='Enable verbose logging')
 @click.option('--force', '-f', is_flag=True, default=False,
               help='Force download and overwrite existing files')
+@click.option('--max-workers', '-w', default=3, type=int,
+              help='Maximum number of parallel downloads (default: 5)')
 @click.pass_context
-def cli(ctx, output_dir, verbose, force):
+def cli(ctx, output_dir, verbose, force, max_workers):
     """GoRails Video Downloader - Download videos from GoRails series."""
     ctx.ensure_object(dict)
-    ctx.obj['downloader'] = GoRailsDownloader(output_dir)
+    ctx.obj['downloader'] = GoRailsDownloader(output_dir, max_workers)
     ctx.obj['verbose'] = verbose
     ctx.obj['force'] = force
 
@@ -656,8 +747,10 @@ def info():
     info_text.append("\n  --force, -f              - Force download and overwrite existing files")
     info_text.append("\n  --output-dir, -o <dir>   - Output directory for downloads")
     info_text.append("\n  --verbose, -v            - Enable verbose logging")
+    info_text.append("\n  --max-workers, -w <num>  - Maximum parallel downloads (default: 3)")
     info_text.append("\n\nFeatures:", style="bold")
     info_text.append("\n  • Skip existing files (use --force to overwrite)")
+    info_text.append("\n  • Parallel video downloads for faster processing")
     info_text.append("\n  • Set file modification time to video creation date")
     info_text.append("\n  • Progress tracking with download speed")
     info_text.append("\n  • Session persistence for authentication")
