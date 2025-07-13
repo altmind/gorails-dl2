@@ -372,7 +372,7 @@ class GoRailsDownloader:
 
             # If we have a shared progress bar, use it
             if progress and task_id is not None:
-                progress.update(task_id, total=total_size)
+                progress.update(task_id, total=total_size, completed=0)
                 
                 with open(filepath, 'wb') as f:
                     downloaded = 0
@@ -394,7 +394,7 @@ class GoRailsDownloader:
                         console=console
                 ) as individual_progress:
 
-                    task = individual_progress.add_task(f"Downloading {filename}", total=total_size)
+                    task = individual_progress.add_task(f"Downloading {filename}", total=total_size, completed=0)
 
                     with open(filepath, 'wb') as f:
                         downloaded = 0
@@ -513,7 +513,7 @@ class GoRailsDownloader:
                 # Add tasks to the progress bar
                 task_ids = {}
                 for url, position, force in download_tasks:
-                    task_id = progress.add_task(f"Preparing episode {position}", total=0)
+                    task_id = progress.add_task(f"Preparing episode {position}", total=1)
                     task_ids[position] = task_id
                 
                 # Prepare download tasks with progress bar and task IDs
