@@ -168,7 +168,7 @@ class GoRailsAuth:
 
 
 class GoRailsDownloader:
-    def __init__(self, output_dir="downloads", max_workers=5):
+    def __init__(self, output_dir="downloads", max_workers=10):
         self.output_dir = output_dir
         self.max_workers = max_workers
         self.auth = GoRailsAuth()
@@ -344,38 +344,112 @@ class GoRailsDownloader:
 
             filepath = os.path.join(self.output_dir, filename)
 
-            # Check if file already exists
+            # Check if file already exists and compare sizes
             if os.path.exists(filepath) and not force:
-                if progress and task_id is not None:
-                    progress.update(task_id, description=f"Skipped {filename}")
-                else:
-                    console.print(f"[yellow]File already exists, skipping: {filename}[/yellow]")
-                return {
-                    'title': title,
-                    'filename': filename,
-                    'filepath': filepath,
-                    'size': os.path.getsize(filepath),
-                    'skipped': True
-                }
+                # Get remote file size first
+                try:
+                    head_response = session.head(url)
+                    head_response.raise_for_status()
+                    remote_size = int(head_response.headers.get('content-length', 0))
+                    local_size = os.path.getsize(filepath)
+                    
+                    if remote_size > 0 and local_size >= remote_size:
+                        # File exists and is complete (same size or larger)
+                        if progress and task_id is not None:
+                            progress.update(task_id, description=f"Skipped {filename}")
+                        else:
+                            console.print(f"[yellow]File already exists and is complete, skipping: {filename} [{format_mb(local_size)}][/yellow]")
+                        return {
+                            'title': title,
+                            'filename': filename,
+                            'filepath': filepath,
+                            'size': local_size,
+                            'skipped': True
+                        }
+                    elif remote_size > 0 and local_size < remote_size:
+                        # File exists but is incomplete (smaller than remote)
+                        if progress and task_id is not None:
+                            progress.update(task_id, description=f"Resuming {filename} ({format_mb(local_size)}/{format_mb(remote_size)})")
+                        else:
+                            console.print(f"[yellow]File exists but is incomplete ({format_mb(local_size)}/{format_mb(remote_size)}), resuming download: {filename}[/yellow]")
+                    else:
+                        # Could not determine remote size, skip to be safe
+                        if progress and task_id is not None:
+                            progress.update(task_id, description=f"Skipped {filename} (unknown remote size)")
+                        else:
+                            console.print(f"[yellow]File already exists, skipping: {filename} (could not determine remote size) [{format_mb(local_size)}][/yellow]")
+                        return {
+                            'title': title,
+                            'filename': filename,
+                            'filepath': filepath,
+                            'size': local_size,
+                            'skipped': True
+                        }
+                except Exception as e:
+                    # If we can't get remote size, skip to be safe
+                    local_size = os.path.getsize(filepath)
+                    if progress and task_id is not None:
+                        progress.update(task_id, description=f"Skipped {filename} (error checking remote size)")
+                    else:
+                        console.print(f"[yellow]File already exists, skipping: {filename} (error checking remote size: {e}) [{format_mb(local_size)}][/yellow]")
+                    return {
+                        'title': title,
+                        'filename': filename,
+                        'filepath': filepath,
+                        'size': local_size,
+                        'skipped': True
+                    }
+
+            # Check if we're resuming a download
+            resume_download = False
+            start_byte = 0
+            if os.path.exists(filepath) and not force:
+                try:
+                    local_size = os.path.getsize(filepath)
+                    head_response = session.head(url)
+                    head_response.raise_for_status()
+                    remote_size = int(head_response.headers.get('content-length', 0))
+                    
+                    if remote_size > 0 and local_size < remote_size:
+                        resume_download = True
+                        start_byte = local_size
+                        log_verbose(f"Resuming download from byte {start_byte} for {filename}")
+                except Exception as e:
+                    log_verbose(f"Could not determine if resume is needed: {e}")
 
             if progress and task_id is not None:
-                progress.update(task_id, description=f"Downloading {filename}")
+                if resume_download:
+                    progress.update(task_id, description=f"Resuming {filename}")
+                else:
+                    progress.update(task_id, description=f"Downloading {filename}")
             else:
-                console.print(f"[green]Downloading: {title}[/green] from [red]{url}[/red]")
+                if resume_download:
+                    console.print(f"[green]Resuming download: {title}[/green] from [red]{url}[/red]")
+                else:
+                    console.print(f"[green]Downloading: {title}[/green] from [red]{url}[/red]")
 
             # Start the download with streaming
-            response = session.get(url, stream=True)
+            headers = {}
+            if resume_download:
+                headers['Range'] = f'bytes={start_byte}-'
+            
+            response = session.get(url, stream=True, headers=headers)
             response.raise_for_status()
 
             # Get file size
             total_size = int(response.headers.get('content-length', 0))
+            if resume_download:
+                # For resumed downloads, content-length is the remaining bytes
+                total_size += start_byte
 
             # If we have a shared progress bar, use it
             if progress and task_id is not None:
-                progress.update(task_id, total=total_size, completed=0)
+                progress.update(task_id, total=total_size, completed=start_byte)
                 
-                with open(filepath, 'wb') as f:
-                    downloaded = 0
+                # Open file in append mode if resuming, write mode if new download
+                file_mode = 'ab' if resume_download else 'wb'
+                with open(filepath, file_mode) as f:
+                    downloaded = start_byte
                     for chunk in response.iter_content(chunk_size=1024*64):
                         if chunk:
                             f.write(chunk)
@@ -394,10 +468,12 @@ class GoRailsDownloader:
                         console=console
                 ) as individual_progress:
 
-                    task = individual_progress.add_task(f"Downloading {filename}", total=total_size, completed=0)
+                    task = individual_progress.add_task(f"Downloading {filename}", total=total_size, completed=start_byte)
 
-                    with open(filepath, 'wb') as f:
-                        downloaded = 0
+                    # Open file in append mode if resuming, write mode if new download
+                    file_mode = 'ab' if resume_download else 'wb'
+                    with open(filepath, file_mode) as f:
+                        downloaded = start_byte
                         for chunk in response.iter_content(chunk_size=1024*64):
                             if chunk:
                                 f.write(chunk)
@@ -417,7 +493,7 @@ class GoRailsDownloader:
                     log_verbose(f"Could not set file modification time: {e}")
 
             if not progress:
-                console.print(f"[green]Successfully downloaded: {filename}[/green]")
+                console.print(f"[green]Successfully downloaded: {filename} [{format_mb(total_size)}][/green]")
             return {
                 'title': title,
                 'filename': filename,
@@ -636,14 +712,19 @@ class GoRailsDownloader:
             return None
 
 
+def format_mb(size_bytes):
+    """Format bytes as MB with zero decimal points."""
+    return f"{round(size_bytes / (1024 * 1024))} MB"
+
+
 @click.group()
 @click.option('--output-dir', '-o', default='downloads',
               help='Output directory for downloaded videos')
 @click.option('--verbose', '-v', is_flag=True, default=False,
               help='Enable verbose logging')
 @click.option('--force', '-f', is_flag=True, default=False,
-              help='Force download and overwrite existing files')
-@click.option('--max-workers', '-w', default=3, type=int,
+              help='Force download and overwrite existing files (bypasses size checking)')
+@click.option('--max-workers', '-w', default=10, type=int,
               help='Maximum number of parallel downloads (default: 5)')
 @click.pass_context
 def cli(ctx, output_dir, verbose, force, max_workers):
@@ -670,9 +751,9 @@ def video(ctx, url):
     info = downloader.download_video(url, force=force)
     if info:
         if info.get('skipped', False):
-            console.print(f"[yellow]File already exists, skipped: {info.get('title', 'Unknown')}[/yellow]")
+            console.print(f"[yellow]File already exists, skipped: {info.get('title', 'Unknown')} [{format_mb(info.get('size', 0))}][/yellow]")
         else:
-            console.print(f"[green]Successfully downloaded: {info.get('title', 'Unknown')}[/green]")
+            console.print(f"[green]Successfully downloaded: {info.get('title', 'Unknown')} [{format_mb(info.get('size', 0))}][/green]")
     else:
         console.print("[red]Failed to download video[/red]")
         sys.exit(1)
@@ -747,8 +828,10 @@ def info():
     info_text.append("\n  --force, -f              - Force download and overwrite existing files")
     info_text.append("\n  --output-dir, -o <dir>   - Output directory for downloads")
     info_text.append("\n  --verbose, -v            - Enable verbose logging")
-    info_text.append("\n  --max-workers, -w <num>  - Maximum parallel downloads (default: 3)")
+    info_text.append("\n  --max-workers, -w <num>  - Maximum parallel downloads (default: 10)")
     info_text.append("\n\nFeatures:", style="bold")
+    info_text.append("\n  • Smart file checking - compares local and remote file sizes")
+    info_text.append("\n  • Resume incomplete downloads automatically")
     info_text.append("\n  • Skip existing files (use --force to overwrite)")
     info_text.append("\n  • Parallel video downloads for faster processing")
     info_text.append("\n  • Set file modification time to video creation date")
